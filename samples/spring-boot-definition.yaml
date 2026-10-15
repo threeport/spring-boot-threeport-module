@@ -1,0 +1,45 @@
+# A Spring Boot definition on its own. Many instances can be deployed from one
+# definition, each in its own namespace with its own database credential.
+#
+#   tptctl spring-boot create spring-boot-definition -c samples/spring-boot-definition.yaml
+SpringBootDefinition:
+  Name: petclinic
+  Image: localhost:5001/spring-petclinic:v0.2.0
+  # deploys PostgreSQL alongside the application and points the datasource at
+  # it. Left out, the application runs on whatever database its image is built
+  # with, which for petclinic is an in-memory H2 that starts empty every time.
+  Database: postgres
+  # read as a comma separated list by Spring and not interpreted here.
+  # petclinic needs its postgres profile to pick up the datasource.
+  Profile: postgres
+  Environment: prod
+  # three replicas. The sample image builds petclinic with Flyway, which takes
+  # a database lock for the duration of a migration, so any number of replicas
+  # can start at once against an empty database: one applies the migrations and
+  # the rest find them already applied.
+  #
+  # Upstream petclinic initialises its schema from spring.sql.init instead, and
+  # that is not concurrency-safe - see the README.
+  Replicas: 3
+  # the port the image serves on. Left out, it defaults to 8080, which is what
+  # Spring Boot uses unless the project changed server.port
+  ServerPort: 8080
+  # where the probes look. Left out, it defaults to the Actuator health
+  # endpoint; an image built without the actuator has to point this somewhere
+  # that answers
+  HealthPath: /actuator/health
+  # CPU and memory for the application container. Left out entirely, the
+  # environment decides: prod would give 1Gi/2Gi of memory and 500m of CPU.
+  # These are set to show the override, and because petclinic settles at about
+  # 300Mi and does not need the prod sizing - 1Gi gives its JVM a 256Mi heap.
+  #
+  # Memory and CPU are defaulted as units: stating either memory field leaves
+  # memory entirely to you, so a request cannot end up above a limit it was
+  # never meant to pair with. No CPU limit is ever defaulted, because a JVM is
+  # at its hungriest while its context starts and a limit throttles it exactly
+  # then.
+  MemoryRequest: 512Mi
+  MemoryLimit: 1Gi
+  CpuRequest: 250m
+  # JAVA_TOOL_OPTIONS, for when a quarter of the limit is the wrong fraction.
+  # Left out here: the limit above is doing the sizing.

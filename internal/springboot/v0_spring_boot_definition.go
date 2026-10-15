@@ -3,23 +3,146 @@
 package springboot
 
 import (
+	"errors"
+	"fmt"
+
 	logr "github.com/go-logr/logr"
+	tpapi "github.com/threeport/threeport/pkg/api/v0"
+	tpclientlib "github.com/threeport/threeport/pkg/client/lib/v0"
+	tpclient "github.com/threeport/threeport/pkg/client/v0"
 	controller "github.com/threeport/threeport/pkg/controller/v0"
+	util "github.com/threeport/threeport/pkg/util/v0"
+
 	v0 "spring-boot-threeport-module/pkg/api/v0"
+	client_v0 "spring-boot-threeport-module/pkg/client/v0"
 )
 
-// v0SpringBootDefinitionCreated performs reconciliation when a v0 SpringBootDefinition
-// has been created.
+// v0SpringBootDefinitionCreated performs reconciliation when a v0
+// SpringBootDefinition has been created.
+//
+// It renders the Kubernetes manifests for the application and hands them to
+// Threeport as a workload definition, then records that workload definition on
+// the Spring Boot definition. The API creates the attached object reference
+// from that foreign key, so nothing here manipulates attachments directly.
 func v0SpringBootDefinitionCreated(
 	r *controller.Reconciler,
 	springBootDefinition *v0.SpringBootDefinition,
 	log *logr.Logger,
 ) (int64, error) {
+	environment := "dev"
+	if springBootDefinition.Environment != nil {
+		environment = *springBootDefinition.Environment
+	}
+
+	replicas := replicasByEnv(environment)
+	if springBootDefinition.Replicas != nil {
+		replicas = *springBootDefinition.Replicas
+	}
+
+	serverPort := v0.DefaultServerPort
+	if springBootDefinition.ServerPort != nil {
+		serverPort = *springBootDefinition.ServerPort
+	}
+
+	healthPath := v0.DefaultHealthPath
+	if springBootDefinition.HealthPath != nil {
+		healthPath = *springBootDefinition.HealthPath
+	}
+
+	// a Spring Boot application can run on an embedded database, so the module
+	// deploys one only when the definition asks for it
+	database := v0.DatabaseNone
+	if springBootDefinition.Database != nil {
+		database = *springBootDefinition.Database
+	}
+
+	var profile string
+	if springBootDefinition.Profile != nil {
+		profile = *springBootDefinition.Profile
+	}
+
+	var javaOpts string
+	if springBootDefinition.JavaOpts != nil {
+		javaOpts = *springBootDefinition.JavaOpts
+	}
+
+	cpuRequest, cpuLimit, memoryRequest, memoryLimit := resourcesFor(
+		springBootDefinition,
+		environment,
+	)
+
+	yamlDoc, err := springBootYaml(springBootManifestInput{
+		definitionName: *springBootDefinition.Name,
+		image:          *springBootDefinition.Image,
+		profile:        profile,
+		serverPort:     serverPort,
+		javaOpts:       javaOpts,
+		cpuRequest:     cpuRequest,
+		cpuLimit:       cpuLimit,
+		memoryRequest:  memoryRequest,
+		memoryLimit:    memoryLimit,
+		replicas:       replicas,
+		environment:    environment,
+		database:       database,
+		healthPath:     healthPath,
+		dbStorageGb:    dbStorageByEnv(environment),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to generate spring boot YAML manifest: %w", err)
+	}
+
+	// reconciliation runs again on requeue, so an existing workload definition
+	// is adopted rather than duplicated
+	nameQuery := fmt.Sprintf("name=%s", *springBootDefinition.Name)
+	existingWorkloadDefinitions, err := tpclient.GetKubernetesWorkloadDefinitionsByQueryString(
+		r.APIClient,
+		r.APIServer,
+		nameQuery,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"failed to check for kubernetes workload definitions with name %s: %w",
+			*springBootDefinition.Name, err,
+		)
+	}
+
+	var workloadDefinition *tpapi.KubernetesWorkloadDefinition
+	if len(*existingWorkloadDefinitions) == 0 {
+		created, err := tpclient.CreateKubernetesWorkloadDefinition(
+			r.APIClient,
+			r.APIServer,
+			&tpapi.KubernetesWorkloadDefinition{
+				Definition:   tpapi.Definition{Name: springBootDefinition.Name},
+				YAMLDocument: &yamlDoc,
+			},
+		)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create kubernetes workload definition: %w", err)
+		}
+		workloadDefinition = created
+	} else {
+		workloadDefinition = &(*existingWorkloadDefinitions)[0]
+	}
+
+	// recording the foreign key is what creates the attachment: the API's
+	// relationship hooks read it and write the attached object reference, which
+	// then blocks the workload definition from being deleted out from under us
+	if _, err := client_v0.UpdateSpringBootDefinition(
+		r.APIClient,
+		r.APIServer,
+		&v0.SpringBootDefinition{
+			Common:                         tpapi.Common{ID: springBootDefinition.ID},
+			KubernetesWorkloadDefinitionID: workloadDefinition.ID,
+		},
+	); err != nil {
+		return 0, fmt.Errorf("failed to record kubernetes workload definition on spring boot definition: %w", err)
+	}
+
 	return 0, nil
 }
 
-// v0SpringBootDefinitionUpdated performs reconciliation when a v0 SpringBootDefinition
-// has been updated.
+// v0SpringBootDefinitionUpdated performs reconciliation when a v0
+// SpringBootDefinition has been updated.
 func v0SpringBootDefinitionUpdated(
 	r *controller.Reconciler,
 	springBootDefinition *v0.SpringBootDefinition,
@@ -28,12 +151,123 @@ func v0SpringBootDefinitionUpdated(
 	return 0, nil
 }
 
-// v0SpringBootDefinitionDeleted performs reconciliation when a v0 SpringBootDefinition
-// has been deleted.
+// v0SpringBootDefinitionDeleted performs reconciliation when a v0
+// SpringBootDefinition has been deleted.
 func v0SpringBootDefinitionDeleted(
 	r *controller.Reconciler,
 	springBootDefinition *v0.SpringBootDefinition,
 	log *logr.Logger,
 ) (int64, error) {
+	// a definition that never got as far as creating its workload has nothing
+	// to clean up
+	if springBootDefinition.KubernetesWorkloadDefinitionID == nil {
+		return 0, nil
+	}
+
+	if _, err := tpclient.DeleteKubernetesWorkloadDefinition(
+		r.APIClient,
+		r.APIServer,
+		*springBootDefinition.KubernetesWorkloadDefinitionID,
+	); err != nil {
+		// the workload definition being gone already is the state we want, and
+		// happens whenever a delete is retried
+		if !errors.Is(err, tpclientlib.ErrObjectNotFound) {
+			return 0, fmt.Errorf(
+				"failed to delete kubernetes workload definition with ID %d: %w",
+				*springBootDefinition.KubernetesWorkloadDefinitionID, err,
+			)
+		}
+	}
+
 	return 0, nil
+}
+
+// resourcesFor returns the application container's CPU and memory, taking what
+// the definition states and filling in the rest from the environment.
+//
+// CPU and memory are defaulted as units: if the definition sets either memory
+// field the module leaves memory alone, and likewise for CPU. Defaulting one
+// side of a pair can produce a request above a limit, which the kube API
+// rejects - a definition asking for a 4Gi request would otherwise be given the
+// environment's 1Gi limit and fail to deploy at all.
+func resourcesFor(
+	springBootDefinition *v0.SpringBootDefinition,
+	environment string,
+) (cpuRequest, cpuLimit, memoryRequest, memoryLimit string) {
+	cpuRequest = util.Deref(springBootDefinition.CpuRequest)
+	cpuLimit = util.Deref(springBootDefinition.CpuLimit)
+	memoryRequest = util.Deref(springBootDefinition.MemoryRequest)
+	memoryLimit = util.Deref(springBootDefinition.MemoryLimit)
+
+	defaults := resourcesByEnv(environment)
+	if cpuRequest == "" && cpuLimit == "" {
+		cpuRequest = defaults.cpuRequest
+	}
+	if memoryRequest == "" && memoryLimit == "" {
+		memoryRequest = defaults.memoryRequest
+		memoryLimit = defaults.memoryLimit
+	}
+
+	return cpuRequest, cpuLimit, memoryRequest, memoryLimit
+}
+
+// envResources is the sizing an environment gets when the definition states
+// none.
+type envResources struct {
+	cpuRequest    string
+	memoryRequest string
+	memoryLimit   string
+}
+
+// resourcesByEnv returns the default sizing for an environment.
+//
+// A memory limit is defaulted because the alternative is worse than a wrong
+// number: without one the JVM reads the node's memory and sizes its heap at a
+// quarter of it, so a pod on a 64Gi node sizes itself for 16Gi and several
+// replicas between them claim an entitlement the node cannot honour. The
+// figures leave a JVM 256MB of heap in development and 512MB in production,
+// against the sample application's roughly 300MB of total usage.
+//
+// There is no default CPU limit. A JVM is at its most CPU-hungry while the
+// application context is starting, and a limit low enough to matter later
+// throttles it exactly then, turning a slow start into a failed one. The
+// request is what the scheduler reserves and is enough to place the pod
+// sensibly.
+func resourcesByEnv(env string) envResources {
+	switch env {
+	case "prod":
+		return envResources{
+			cpuRequest:    "500m",
+			memoryRequest: "1Gi",
+			memoryLimit:   "2Gi",
+		}
+	default:
+		return envResources{
+			cpuRequest:    "250m",
+			memoryRequest: "512Mi",
+			memoryLimit:   "1Gi",
+		}
+	}
+}
+
+// replicasByEnv returns the default replica count for an environment, used when
+// the definition does not state one.
+func replicasByEnv(env string) int {
+	switch env {
+	case "prod":
+		return 3
+	default:
+		return 1
+	}
+}
+
+// dbStorageByEnv returns the database volume size in gigabytes for an
+// environment.
+func dbStorageByEnv(env string) int {
+	switch env {
+	case "prod":
+		return 100
+	default:
+		return 20
+	}
 }
